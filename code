@@ -1,0 +1,180 @@
+#include <ESP8266WiFi.h>
+#include <FirebaseESP8266.h>
+#include <TimeLib.h>
+#include <ESP8266HTTPClient.h>
+#include <ArduinoJson.h>
+
+// Firebase project credentials
+#define FIREBASE_HOST "connection-of-esp8266-default-rtdb.firebaseio.com"
+#define FIREBASE_AUTH "XY8uL9BUWwklJTFcNeHy1ShSxK3gmfXyjVnyNxbq"
+
+// Wi-Fi credentials
+#define WIFI_SSID "PRO Guest"
+#define WIFI_PASSWORD "prorgIN$!"
+
+// Define Firebase objects
+FirebaseData firebaseData;
+FirebaseConfig config;
+FirebaseAuth auth;
+
+// Sample window and reference voltage settings
+const int sampleWindow = 50; // Sample window width in milliseconds (50ms for fast response)
+const float referenceVoltage = 0.00631; // Reference voltage for 0 dB (adjust based on calibration)
+const int delayTime = 1000; // Delay time in milliseconds
+
+unsigned long startTime = 0; // Variable to store start time
+
+void setup() {
+  Serial.begin(115200); // Initialize serial communication
+
+  // Connect to Wi-Fi
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println();
+  Serial.println("Connected to Wi-Fi");
+
+  // Set time via NTP for SSL/TLS certificate validation
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("Waiting for NTP time sync: ");
+  while (!time(nullptr)) {
+    Serial.print(".");
+    delay(1000);
+  }
+  Serial.println();
+  Serial.println("Time synchronized");
+
+  // Assign Firebase host and auth
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+
+  // Initialize Firebase
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Initialize start time
+  startTime = millis(); // Start time relative to program start
+}
+
+String convertUnixToDate(time_t unixTime) {
+  unixTime += 19800; // Add 5 hours and 30 minutes (19800 seconds) for IST offset
+  struct tm *timeinfo;
+  timeinfo = gmtime(&unixTime); // Get time from Unix timestamp in UTC and add offset
+
+  char buffer[11]; // Buffer size for "YYYY-MM-DD"
+  sprintf(buffer, "%04d-%02d-%02d", timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday);
+
+  return String(buffer);
+}
+
+String convertUnixToTime(time_t unixTime) {
+  unixTime += 19800; // Add 5 hours and 30 minutes (19800 seconds) for IST offset
+  struct tm *timeinfo;
+  timeinfo = gmtime(&unixTime); // Get time from Unix timestamp in UTC and add offset
+
+  char buffer[9]; // Buffer size for "HH:mm:ss"
+  sprintf(buffer, "%02d:%02d:%02d", timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+
+  return String(buffer);
+}
+
+void getLocation(double &latitude, double &longitude) {
+  HTTPClient http;
+  WiFiClient client;
+
+  // Correct API call with WiFiClient
+  http.begin(client, "http://ipinfo.io/json");
+
+  int httpCode = http.GET();
+
+  if (httpCode > 0) {
+    String payload = http.getString();
+    Serial.println(payload);
+
+    // Parse JSON data
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, payload);
+
+    String loc = doc["loc"];
+    int commaIndex = loc.indexOf(',');
+    latitude = loc.substring(0, commaIndex).toFloat();
+    longitude = loc.substring(commaIndex + 1).toFloat();
+
+    Serial.print("Latitude: ");
+    Serial.println(latitude);
+    Serial.print("Longitude: ");
+    Serial.println(longitude);
+  } else {
+    Serial.println("Error in HTTP request");
+  }
+
+  http.end();
+}
+
+void loop() {
+  double latitude = 0.0, longitude = 0.0;
+  getLocation(latitude, longitude);
+
+  unsigned long startMillis = millis(); // Start of sample window
+  unsigned long endMillis = startMillis + sampleWindow; // End of sample window
+  float peakToPeak = 0;
+  int signalMax = 0;
+  int signalMin = 1023; // Initialize to 1023 for correct min tracking
+
+  while (millis() < endMillis) {
+    int sensorValue = analogRead(A0); // Read the current analog input
+    if (sensorValue > signalMax) {
+      signalMax = sensorValue; // Save the maximum value
+    }
+    if (sensorValue < signalMin) {
+      signalMin = sensorValue; // Save the minimum value
+    }
+  }
+
+  peakToPeak = signalMax - signalMin; // Calculate peak-to-peak voltage
+  float voltage = peakToPeak * (3.3 / 1024.0); // Convert to voltage
+
+  // Calculate RMS voltage from peak-to-peak voltage
+  float rmsVoltage = voltage / sqrt(2);
+
+  // Convert RMS voltage to decibels (SPL)
+  float decibels = 20 * log10(rmsVoltage / referenceVoltage);
+
+  // Handle cases where there is no sound
+  if (rmsVoltage < referenceVoltage * 0.01) { // Use a fraction of reference voltage
+    decibels = 0;
+  }
+
+  Serial.println(decibels); // Print the decibel value for plotting
+
+  // Fetch current Unix timestamp
+  time_t currentUnixTime = time(nullptr);
+
+  // Convert Unix timestamp to IST formatted date (YYYY-MM-DD)
+  String istDate = convertUnixToDate(currentUnixTime);
+
+  // Convert Unix timestamp to IST formatted time (HH:mm:ss)
+  String istTime = convertUnixToTime(currentUnixTime);
+
+  // Prepare JSON data using FirebaseJson
+  FirebaseJson json;
+  json.add("decibel", decibels); // Store decibels as number
+  json.add("date", istDate.c_str()); // Store IST formatted date as string
+  json.add("time", istTime.c_str()); // Store IST formatted time as string
+  json.add("latitude", latitude); // Store latitude
+  json.add("longitude", longitude); // Store longitude
+
+  // Write data to Firebase under a Device1
+  String newKey = "/sensor/data/Device1";
+  if (Firebase.pushJSON(firebaseData, newKey, json)) {
+    Serial.println("Data sent to Firebase under Device1");
+  } else {
+    Serial.println("Failed to send data to Firebase under Device1");
+    Serial.println(firebaseData.errorReason());
+  }
+
+  delay(delayTime - sampleWindow); // Delay for the rest of the interval
+}
